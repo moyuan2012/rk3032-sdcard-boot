@@ -1,0 +1,93 @@
+name: Build RK3032 Stable Linux
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+
+    steps:
+    - name: Verify Runner Architecture
+      run: |
+        ARCH=$(uname -m)
+        echo "Runner architecture: $ARCH"
+        if [ "$ARCH" != "x86_64" ]; then
+          echo "::error::Expected x86_64 runner, got $ARCH. Cross-compilation will fail."
+          exit 1
+        fi
+
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Free Disk Space
+      run: |
+        sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+        sudo docker image prune --all --force
+        df -h
+
+    - name: Install Build Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential gcc-arm-linux-gnueabihf g++ make bison flex \
+          libssl-dev device-tree-compiler dosfstools e2fsprogs parted wget \
+          cpio rsync git bc lzop libncurses5-dev python3-dev python3-setuptools \
+          python3-pyelftools swig file unzip pigz
+
+    - name: Cache Buildroot Download Directory
+      uses: actions/cache@v4
+      id: cache-dl
+      with:
+        path: /opt/buildroot/dl
+        key: ${{ runner.os }}-buildroot-dl-${{ hashFiles('configs/rk3032_sdcard_defconfig') }}
+        restore-keys: |
+          ${{ runner.os }}-buildroot-dl-
+
+    - name: Cache Buildroot Output (ccache + build dir)
+      uses: actions/cache@v4
+      id: cache-output
+      with:
+        path: |
+          /opt/buildroot/output
+          /opt/buildroot/ccache
+        key: ${{ runner.os }}-buildroot-output-${{ hashFiles('configs/rk3032_sdcard_defconfig') }}
+        restore-keys: |
+          ${{ runner.os }}-buildroot-output-
+
+    - name: Clone Buildroot (Shallow)
+      run: |
+        git clone --depth 1 -b 2023.11.x https://github.com/buildroot/buildroot.git /opt/buildroot
+
+    - name: Enable ccache and Set Build Options
+      run: |
+        cd /opt/buildroot
+        grep -q "^BR2_CCACHE=y" configs/rk3032_sdcard_defconfig || \
+          echo "BR2_CCACHE=y" >> configs/rk3032_sdcard_defconfig
+        echo "BR2_CCACHE_INITIAL_SETUP=\"5G\"" >> configs/rk3032_sdcard_defconfig
+
+    - name: Configure and Build
+      run: |
+        export BR2_EXTERNAL=${{ github.workspace }}
+        cd /opt/buildroot
+        chmod +x $BR2_EXTERNAL/board/rk3032/post-image.sh
+        make rk3032_sdcard_defconfig
+        make -j2
+
+    - name: Compress Image
+      run: |
+        pigz -9 -k /opt/buildroot/output/images/sdcard.img
+        ls -lh /opt/buildroot/output/images/sdcard.img.gz
+
+    - name: Upload SD Card Image
+      uses: actions/upload-artifact@v4
+      with:
+        name: rk3032-stable-sdcard-image
+        path: /opt/buildroot/output/images/sdcard.img.gz
+        retention-days: 7
